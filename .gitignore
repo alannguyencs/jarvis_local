@@ -1,0 +1,42 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-error.log*
+.next/
+coverage/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# Logs
+*.log
+
+# App
+logs/
+frontend/dist/

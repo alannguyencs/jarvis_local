@@ -1,0 +1,190 @@
+/* Same palette as Jarvis (Knowledge Base's dark page: Tailwind slate-950 /
+   slate-100, slate-500 muted text, sky buttons), kept as plain values. */
+:root {
+  --bg: #020617; /* slate-950 */
+  --text: #f1f5f9; /* slate-100 */
+  --muted: #64748b; /* slate-500 */
+  --border: #334155; /* slate-700 */
+  --accent: #0284c7; /* sky-600 */
+  --accent-hover: #0ea5e9; /* sky-500 */
+  --button: #075985; /* sky-800 */
+  --button-hover: #0369a1; /* sky-700 */
+  --button-border: #0369a1; /* sky-700 */
+  --button-text: #e0f2fe; /* sky-100 */
+  color-scheme: dark;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background-color: var(--bg);
+  color: var(--text);
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+button {
+  border: 1px solid var(--button-border);
+  border-radius: 0.5rem;
+  padding: 0.5rem 1rem;
+  background: var(--button);
+  color: var(--button-text);
+  font: inherit;
+  font-weight: 500;
+  cursor: pointer;
+}
+button:hover {
+  background: var(--button-hover);
+}
+button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+button.secondary {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+button.secondary:hover:not(:disabled) {
+  border-color: var(--accent-hover);
+}
+button.small {
+  padding: 0.3rem 0.7rem;
+  font-size: 0.85rem;
+}
+
+/* --- app frame --------------------------------------------------------- */
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.75rem 16px;
+  border-bottom: 1px solid var(--border);
+}
+.brand {
+  color: var(--text);
+  font-weight: 700;
+  font-size: 1.1rem;
+}
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+.page {
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 1.5rem 16px 4rem;
+}
+.muted {
+  color: var(--muted);
+}
+.small {
+  font-size: 0.85rem;
+}
+.error {
+  color: #fb7185; /* rose-400 */
+}
+
+/* --- voice ------------------------------------------------------------- */
+.voice {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+.banner {
+  margin: 0;
+  padding: 0.75rem 1rem;
+  border: 1px solid currentColor;
+  border-radius: 0.5rem;
+}
+.controls {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+  padding-top: 2rem;
+}
+.mic {
+  display: grid;
+  place-items: center;
+  width: 96px;
+  height: 96px;
+  padding: 0;
+  border-radius: 50%;
+  touch-action: none; /* hold-to-talk: no scroll or long-press menu */
+  user-select: none;
+  -webkit-user-select: none;
+}
+.mic.recording {
+  background: #be123c; /* rose-700 */
+  border-color: #fb7185; /* rose-400 */
+  color: #fff1f2;
+  animation: pulse 1.2s ease-in-out infinite;
+}
+@keyframes pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgb(251 113 133 / 0.5); }
+  50% { box-shadow: 0 0 0 14px rgb(251 113 133 / 0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .mic.recording { animation: none; }
+}
+.status {
+  margin: 0;
+  color: var(--muted);
+}
+.status.listening {
+  color: #fb7185;
+}
+
+.transcript {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+.turn {
+  max-width: 80%;
+  padding: 0.6rem 0.9rem;
+  border-radius: 0.75rem;
+  border: 1px solid var(--border);
+}
+.turn p {
+  margin: 0;
+  white-space: pre-wrap;
+}
+.turn .speaker {
+  display: block;
+  margin-bottom: 0.15rem;
+  color: var(--muted);
+}
+.turn.user {
+  align-self: flex-end;
+  background: #0c4a6e; /* sky-900 */
+  border-color: var(--button-border);
+}
+.turn.assistant {
+  align-self: flex-start;
+}
+.turn.error {
+  align-self: center;
+  border: none;
+  color: #fb7185;
+  font-size: 0.9rem;
+}
+.turn .replay {
+  margin-top: 0.5rem;
+}
+.turn.assistant.speaking {
+  border-color: var(--accent-hover);
+}
+.turn .timing {
+  display: block;
+  margin-top: 0.35rem;
+  font-variant-numeric: tabular-nums;
+}

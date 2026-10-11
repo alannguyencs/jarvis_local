@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+python-multipart  # file uploads (POST /api/stt)
+pydantic>=2.10,<3.0
+pydantic-settings>=2.6,<3.0
+numpy
+parakeet-mlx  # STT: nvidia/parakeet-tdt-0.6b-v2 on Apple Silicon (needs ffmpeg)
+kokoro>=0.9.4  # TTS: hexgrad/Kokoro-82M (pulls torch; espeak-ng comes bundled)
+soundfile
+# Kokoro's English front end needs this spaCy model; without it misaki
+# pip-installs it on first use, in the middle of a request.
+en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
+pytest
+httpx2  # FastAPI's TestClient
