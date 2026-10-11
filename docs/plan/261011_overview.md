@@ -65,7 +65,7 @@ jarvis_local/
 │   │   ├── api/
 │   │   │   ├── api_router.py   everything under /api
 │   │   │   ├── stt.py          POST /api/stt
-│   │   │   ├── ask.py          POST /api/ask
+│   │   │   ├── ask.py          POST /api/ask, POST /api/ask/stream
 │   │   │   └── tts.py          POST /api/tts
 │   │   ├── schemas/
 │   │   │   └── voice.py        SttOut, AskIn, AskOut, TtsIn
@@ -122,7 +122,8 @@ SQLAlchemy and migrations, the notification socket and the production
 | Method + path | Request | Response | Errors |
 |---------------|---------|----------|--------|
 | `POST /api/stt` | multipart `audio` (webm/ogg/mp4/wav) | `{text, duration_s}` | 422 if empty, too long, can't decode or no speech |
-| `POST /api/ask` | `{text, session_id?}` | `{answer, session_id, duration_ms}` | 422 if text is empty, 502 if claude exits non-zero or gives an error result, 504 on timeout |
+| `POST /api/ask` | `{text, session_id?}` | `{answer, session_id, duration_ms, warm, first_text_ms}` | 422 if text is empty, 502 if claude exits non-zero or gives an error result, 504 on timeout |
+| `POST /api/ask/stream` | `{text, session_id?}` | newline-delimited JSON events: `session`, `delta` (text as Claude writes), then `done` (as `/api/ask`) or `error` `{status, detail}` with the status `/api/ask` would give (§4.4.2). The page uses this one | 422 if text is empty (a plain response) |
 | `POST /api/tts` | `{text}` | `audio/wav` bytes | 422 if nothing speakable is left |
 | `GET /health` | — | `{status, stt_loaded, tts_loaded}` | — |
 
@@ -205,6 +206,24 @@ can't be started early, because it gives up after 3 s with no input. The
 - An unknown `--resume` id makes the prepared process exit at once. Its
   stderr still gives the 404.
 
+### 4.4.2 Streaming the answer
+
+The CLI also runs with `--include-partial-messages`, so it prints a text
+delta as Claude writes. `claude_cli.ask_stream()` yields the session id
+from the CLI's first (`system`) event, then each delta, then the finished
+answer. `ask()` is the same stream read to the end. On the real CLI, the
+first words came about 1.25 s after the question, while the whole answer
+took 2.1 s, and the gap grows with longer answers.
+
+- `POST /api/ask/stream` sends these as newline-delimited JSON. Failures
+  after the response has started are an `error` event carrying the status
+  `/api/ask` would have given.
+- When the client goes away, the stream is closed and the CLI is killed.
+  The conversation still resumes afterwards: tested by killing an answer
+  partway, then asking two follow-ups that both remembered it.
+- The Vite dev proxy keeps its backend request open when the browser
+  cancels. `vite.config.js` closes it, so a cancel reaches the backend.
+
 ### 4.5 TTS service
 
 - `speech_text.clean(md) -> str`: remove code blocks (replace each with
@@ -255,17 +274,37 @@ One page, `VoicePage`:
 - `localhost` counts as a secure context, so `getUserMedia` works over plain
   http.
 
-### 5.1 Speaking in pieces (phase 5)
+### 5.1 Speaking from the first sentence
 
-Kokoro makes the whole answer before any of it plays. That took 2–4.6 s
-for real answers of 240–574 characters. The page now splits the answer
-(`utils/speechChunks.js`). The opening sentence (at least 30 characters) is
-one piece. The rest come in pieces of at least 200 characters, and a
-sentence is never cut. Each piece is requested once the one before has
-arrived, so the next is made while the current one plays. Speech is made
-about 8× faster than it is spoken, so the pieces follow with no gap you can
-hear (≤ 10 ms measured). The voice now starts 0.5–0.8 s after Claude
-answers, whatever the answer's length.
+The page reads `/api/ask/stream`: the answer bubble fills in as Claude
+writes. `utils/speechChunks.js` (`createChunker`) lets out a piece only
+once its sentence is finished, which means whitespace has followed its
+`. ! ?`, so the "2." in "2.1" is not an end. Pieces go to a speech queue
+(`utils/speechQueue.js`). The queue asks for each piece's audio once the one
+before it has arrived, and the page plays the pieces as they come:
+
+- The first piece is the opening sentence, at least 30 characters. If
+  that sentence is over 90 characters, the piece ends at the last clause
+  break (`, ; : —`) between characters 30 and 90. That piece decides when
+  the voice starts, and the voice pauses there anyway.
+- Later pieces are at least 200 characters. They are made while the
+  earlier ones play: speech is made about 8× faster than it is spoken, and
+  the pieces follow with ≤ 10 ms between them.
+- Pressing the mic, *Stop speaking* or *New conversation* aborts the
+  stream, and the backend kills Claude. What was written stays in the chat.
+  The session id arrives before any text, so a follow-up works even after
+  a stop partway.
+- Thinking (mic disabled) lasts until the first piece can be spoken. From
+  then on the mic interrupts.
+
+Measured from releasing the mic to the first sound, on the same three
+spoken questions:
+
+| | Phase 5 (whole answer, then speak) | Streaming |
+|---|---|---|
+| Three facts about the moon | 3.6 s | 2.1–2.5 s |
+| Virus vs bacteria | 5.8 s | 2.7 s (5.2 s once, when Claude took 3.5 s to its first words and the opening sentence had no clause break) |
+| A tip for sleeping better | 6.1 s | 2.6–2.9 s |
 
 ### 5.2 Timing (phase 5)
 
@@ -273,8 +312,10 @@ Every turn logs its steps:
 - The backend logs `stt took … ms`, `claude answered in … ms
   (warm|cold, …)` and `tts took … ms for … chars`.
 - The page shows each step's time under the answer and writes it to the
-  console: `heard 0.5 s · Claude 1.9 s (warm) · voice 0.6 s · first sound
-  3.0 s`.
+  console: `heard 0.5 s · Claude 1.3 s (warm) · sentence 0.2 s · voice
+  0.6 s · first sound 2.6 s`. Claude is the time to its first words,
+  sentence is the time from there to the first piece that can be spoken,
+  and voice is that piece's audio.
 
 ## 6. Error Handling
 
@@ -298,10 +339,6 @@ Every turn logs its steps:
 
 ## 8. Later (Not in v1)
 
-- **Faster answers through streaming.** Use `claude -p --output-format
-  stream-json`, cut the text into sentences, run TTS on each sentence as it
-  arrives, and stream the audio over a WebSocket. This removes most of the
-  wait before the first sound.
 - **Wake word or voice detection** for hands-free use (Silero VAD in the
   browser).
 - **Saved conversations.** A small SQLite table (`conversation_id`,

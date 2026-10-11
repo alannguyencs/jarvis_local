@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { ApiError, getHealth } from "../api/client";
-import { ask, stt, tts } from "../api/voice";
+import { askStream, stt, tts } from "../api/voice";
 import MicButton from "../composites/MicButton";
 import StatusLine from "../composites/StatusLine";
 import Transcript from "../composites/Transcript";
@@ -8,10 +8,15 @@ import useAudioPlayer from "../hooks/useAudioPlayer";
 import useRecorder from "../hooks/useRecorder";
 import { loadChat, saveChat } from "../utils/chatStorage";
 import { micErrorMessage } from "../utils/recording";
-import { speechChunks } from "../utils/speechChunks";
+import { createChunker, speechChunks } from "../utils/speechChunks";
+import { createSpeechQueue } from "../utils/speechQueue";
 import { formatTiming } from "../utils/timing";
 
-/** The voice page: speak a question, hear (and read) Claude's answer, ask the next one. */
+/**
+ * The voice page: speak a question, hear (and read) Claude's answer, ask the
+ * next one. The answer streams in as Claude writes it, and the voice starts
+ * at its first sentence.
+ */
 export default function VoicePage() {
   const [backend, setBackend] = useState("checking");
   const [status, setStatus] = useState("ready");
@@ -27,9 +32,11 @@ export default function VoicePage() {
   // cleared: a turn whose number is stale was interrupted, so it must not
   // start playing or reset the status.
   const turnNo = useRef(0);
-  // Each answer's audio requests (one per spoken piece), so Replay never asks
-  // for them again, even while they are still running (memory only).
+  // Each answer's speech queue, so Replay never asks for its audio again,
+  // even while it is still being made (memory only).
   const audioCache = useRef(new Map());
+  // Stops the answer Claude is writing, if any.
+  const stream = useRef(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -38,6 +45,7 @@ export default function VoicePage() {
       .catch(() => !cancelled && setBackend("down"));
     return () => {
       cancelled = true;
+      stream.current?.abort();
     };
   }, []);
 
@@ -45,59 +53,58 @@ export default function VoicePage() {
     saveChat(chat);
   }, [chat]);
 
+  // Thinking lasts until the first sentence can be spoken; from then on the
+  // mic interrupts.
   const busy = status === "transcribing" || status === "thinking";
   const addTurn = (role, text) => {
     const id = nextId.current++;
     setChat((c) => ({ ...c, turns: [...c.turns, { id, role, text }] }));
     return id;
   };
+  const updateTurn = (id, fields) =>
+    setChat((c) => ({ ...c, turns: c.turns.map((t) => (t.id === id ? { ...t, ...fields } : t)) }));
   const setSession = (id) => setChat((c) => ({ ...c, sessionId: id }));
-  const setTiming = (id, timing) =>
-    setChat((c) => ({ ...c, turns: c.turns.map((t) => (t.id === id ? { ...t, timing } : t)) }));
 
-  /** Cut off any spoken answer and make every running turn stale. */
+  /** Cut off any spoken answer, stop Claude, and make every running turn stale. */
   function interrupt() {
     turnNo.current += 1;
+    stream.current?.abort();
+    stream.current = null;
     player.stop();
     setSpeakingId(null);
   }
 
-  /**
-   * The audio for each spoken piece of an answer, as promises in order. Each
-   * piece is asked for once the one before it has arrived, so they come in
-   * order and the next is made while the current one plays.
-   */
-  function audioFor(turn) {
+  /** The speech queue of a finished answer: cached, else made from its text. */
+  function queueFor(turn) {
     if (!audioCache.current.has(turn.id)) {
-      let previous = Promise.resolve();
-      const requests = speechChunks(turn.text).map((chunk) => (previous = previous.then(() => tts(chunk))));
-      audioCache.current.set(turn.id, requests);
-      for (const request of requests) {
-        request.catch(() => audioCache.current.delete(turn.id)); // let Replay retry
-      }
+      const queue = createSpeechQueue(tts);
+      speechChunks(turn.text).forEach((piece) => queue.add(piece));
+      queue.close();
+      audioCache.current.set(turn.id, queue);
     }
     return audioCache.current.get(turn.id);
   }
 
   /**
-   * Read an answer aloud, piece by piece. Resolves when it ends or is
-   * interrupted. `isStale()` says whether the caller's turn is over;
-   * `onAudio()` fires when the first piece has arrived, `onPlaying()` when
-   * sound starts.
+   * Play an answer's queue, piece by piece, waiting for pieces still being
+   * written. Resolves when it ends or is interrupted. `isStale()` says
+   * whether the caller's turn is over; `onAudio()` fires when the first
+   * piece has arrived, `onPlaying()` when sound starts.
    */
-  async function speak(turn, isStale, { onAudio, onPlaying } = {}) {
+  async function speak(id, queue, isStale, { onAudio, onPlaying } = {}) {
     setStatus("speaking");
-    setSpeakingId(turn.id);
+    setSpeakingId(id);
     try {
-      const pieces = audioFor(turn);
-      for (const [i, request] of pieces.entries()) {
-        const audio = await request;
+      let i = 0;
+      for await (const audio of queue) {
         if (i === 0) onAudio?.();
         if (isStale()) break;
         await player.play(audio, i === 0 ? { onPlaying } : {});
         if (isStale()) break;
+        i += 1;
       }
     } catch (e) {
+      audioCache.current.delete(id); // let Replay try again
       if (!isStale()) addTurn("error", `Couldn't speak this answer: ${e.message}`);
     } finally {
       if (!isStale()) setSpeakingId(null);
@@ -120,22 +127,18 @@ export default function VoicePage() {
     const released = performance.now();
     const blob = await recorder.stop();
     if (!blob) return;
-    const timing = {};
-    let mark = performance.now();
-    const lap = () => {
-      const now = performance.now();
-      const ms = Math.round(now - mark);
-      mark = now;
-      return ms;
-    };
     const myTurn = turnNo.current;
     const isStale = () => turnNo.current !== myTurn;
+    // When each step finished, for the timing line under the answer.
+    const at = { sttStart: performance.now() };
+    let id = null;
+    let speaking = null;
     try {
       setStatus("transcribing");
       let text;
       try {
         ({ text } = await stt(blob));
-        timing.stt = lap();
+        at.heard = performance.now();
       } catch (e) {
         addTurn("error", sttErrorMessage(e));
         return;
@@ -143,12 +146,54 @@ export default function VoicePage() {
       addTurn("user", text);
 
       setStatus("thinking");
+      const queue = createSpeechQueue(tts);
+      const chunker = createChunker();
+      const showTiming = (extra = {}) => id !== null && updateTurn(id, { timing: { ...timingFrom(at), ...extra } });
+      const startSpeaking = () => {
+        if (speaking || isStale() || queue.size === 0) return;
+        speaking = speak(id, queue, isStale, {
+          onAudio: () => (at.audio = performance.now()),
+          onPlaying: () => {
+            at.sound = performance.now();
+            showTiming({ firstSound: Math.round(at.sound - released) });
+          },
+        });
+      };
+      const addPieces = (pieces) => {
+        for (const piece of pieces) {
+          at.sentence ??= performance.now();
+          queue.add(piece);
+        }
+        startSpeaking();
+      };
+      const answerTurn = (answerText) => {
+        if (id === null) {
+          id = addTurn("assistant", answerText);
+          audioCache.current.set(id, queue);
+        } else {
+          updateTurn(id, { text: answerText });
+        }
+      };
+
+      const controller = new AbortController();
+      stream.current = controller;
+      let written = "";
       let answer;
       try {
-        answer = await ask(text, sessionId);
-        timing.claude = lap();
-        timing.warm = answer.warm;
+        answer = await askStream(text, sessionId, {
+          signal: controller.signal,
+          // Known before any text, so a follow-up works even after a stop partway.
+          onSession: (sid) => !isStale() && setSession(sid),
+          onDelta: (delta) => {
+            at.firstWords ??= performance.now();
+            written += delta;
+            answerTurn(written);
+            addPieces(chunker.push(delta));
+          },
+        });
       } catch (e) {
+        queue.close();
+        if (e.name === "AbortError" || isStale()) return; // interrupted: what was written stays
         if (e instanceof ApiError && e.status === 404) {
           // The CLI no longer has this conversation: the next question starts a new one.
           setSession(null);
@@ -157,22 +202,23 @@ export default function VoicePage() {
           addTurn("error", e.message);
         }
         return;
+      } finally {
+        if (stream.current === controller) stream.current = null;
       }
-      setSession(answer.session_id);
-      const id = addTurn("assistant", answer.answer);
-      if (!isStale()) {
-        await speak({ id, text: answer.answer }, isStale, {
-          onAudio: () => (timing.voice = lap()),
-          onPlaying: () => {
-            timing.firstSound = Math.round(performance.now() - released);
-            setTiming(id, { ...timing });
-            console.info(`[jarvis-local] ${formatTiming(timing)}`);
-          },
-        });
-      }
-      // No sound (stopped, or the voice failed): still show the steps that ran.
-      if (timing.firstSound == null) setTiming(id, { ...timing });
+
+      answerTurn(answer.answer);
+      addPieces(chunker.flush());
+      queue.close();
+      if (!isStale()) setSession(answer.session_id);
+      at.warm = answer.warm;
+      startSpeaking();
+      await speaking;
+      const t = timingFrom(at, released);
+      showTiming(t);
+      if (t.firstSound != null) console.info(`[jarvis-local] ${formatTiming(t)}`);
     } finally {
+      // An error partway still lets what was already queued finish playing.
+      await speaking;
       if (!isStale()) setStatus("ready");
     }
   }
@@ -181,7 +227,7 @@ export default function VoicePage() {
     interrupt();
     const myTurn = turnNo.current;
     const isStale = () => turnNo.current !== myTurn;
-    await speak(turn, isStale);
+    await speak(turn.id, queueFor(turn), isStale);
     if (!isStale()) setStatus("ready");
   }
 
@@ -239,6 +285,19 @@ export default function VoicePage() {
       </main>
     </>
   );
+}
+
+/** Each step's time from the moments in `at` (see formatTiming). */
+function timingFrom(at, released) {
+  const span = (from, to) => (from != null && to != null ? Math.round(to - from) : undefined);
+  return {
+    stt: span(at.sttStart, at.heard),
+    claude: span(at.heard, at.firstWords),
+    sentence: span(at.firstWords, at.sentence),
+    voice: span(at.sentence, at.audio),
+    firstSound: released != null ? span(released, at.sound) : undefined,
+    warm: at.warm,
+  };
 }
 
 function sttErrorMessage(e) {

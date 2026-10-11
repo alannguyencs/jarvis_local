@@ -27,7 +27,7 @@ async function readDetail(res) {
   return `Request failed (${res.status})`;
 }
 
-async function send(method, path, body, accept) {
+async function send(method, path, body, accept, signal) {
   const headers = { Accept: accept };
   const isForm = body instanceof FormData;
   if (body !== undefined && !isForm) headers["Content-Type"] = "application/json";
@@ -35,6 +35,7 @@ async function send(method, path, body, accept) {
     method,
     headers,
     body: body === undefined || isForm ? body : JSON.stringify(body),
+    signal,
   });
   if (!res.ok) throw new ApiError(res.status, await readDetail(res));
   return res;
@@ -48,6 +49,27 @@ async function send(method, path, body, accept) {
 export async function request(method, path, body) {
   const res = await send(method, path, body, "application/json");
   return res.status === 204 ? null : res.json();
+}
+
+/**
+ * Like request(), for an endpoint that streams newline-delimited JSON: calls
+ * `onEvent(event)` for each line as it arrives and resolves when the stream
+ * ends. `signal` (an AbortSignal) stops it; that rejects with an AbortError.
+ */
+export async function requestLines(method, path, body, onEvent, signal) {
+  const res = await send(method, path, body, "application/x-ndjson", signal);
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffered = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    buffered += decoder.decode(value, { stream: !done });
+    const lines = buffered.split("\n");
+    buffered = lines.pop();
+    for (const line of lines) if (line.trim()) onEvent(JSON.parse(line));
+    if (done) break;
+  }
+  if (buffered.trim()) onEvent(JSON.parse(buffered));
 }
 
 /** Like request(), for an endpoint that answers with a file: returns a Blob. */

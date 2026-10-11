@@ -1,3 +1,5 @@
+import asyncio
+import json
 import time
 from pathlib import Path
 
@@ -38,6 +40,7 @@ def test_command_flags():
     assert flags["--effort"] == "low"
     assert flags["--input-format"] == "stream-json"
     assert flags["--output-format"] == "stream-json"
+    assert "--include-partial-messages" in cmd
     assert flags["--tools"] == ""
     assert "--resume" not in cmd
     # Isolated by default: the user's hooks, MCP servers and skills stay out.
@@ -138,10 +141,92 @@ def test_parse_result_rejects_empty_answer():
         claude_cli.parse_result({"subtype": "success", "is_error": False, "result": " ", "session_id": NEW_SESSION})
 
 
-def test_find_result_skips_other_events_and_junk():
-    out = b'{"type":"system","subtype":"init"}\nnot json\n{"type":"result","result":"hi"}\n'
-    assert claude_cli.find_result(out) == {"type": "result", "result": "hi"}
-    assert claude_cli.find_result(b"nothing here") is None
+def test_text_delta_reads_only_text_deltas():
+    delta = {"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "Hi"}}}
+    assert claude_cli.text_delta(delta) == "Hi"
+    assert claude_cli.text_delta({"type": "stream_event", "event": {"type": "message_stop"}}) == ""
+    assert claude_cli.text_delta({"type": "result", "result": "Hi"}) == ""
+    assert claude_cli.parse_event(b"not json") is None
+
+
+# --- POST /api/ask/stream ----------------------------------------------------------
+
+
+def stream(body):
+    with TestClient(app) as client:
+        res = client.post("/api/ask/stream", json=body)
+    return res, [json.loads(line) for line in res.text.splitlines()]
+
+
+def test_stream_sends_session_then_deltas_then_done():
+    res, events = stream({"text": "What is the capital of France?"})
+    assert res.status_code == 200
+    assert res.headers["content-type"].startswith("application/x-ndjson")
+    assert events[0] == {"type": "session", "session_id": NEW_SESSION}
+    deltas = [e["text"] for e in events if e["type"] == "delta"]
+    assert "".join(deltas) == "echo: What is the capital of France?"
+    assert len(deltas) > 1
+    done = events[-1]
+    assert done["type"] == "done"
+    assert done["answer"] == "echo: What is the capital of France?"
+    assert done["session_id"] == NEW_SESSION
+    assert done["first_text_ms"] is not None
+
+
+def test_stream_follow_up_skips_the_session_event():
+    _, events = stream({"text": "again", "session_id": OLD_SESSION})
+    assert events[0]["type"] == "delta"  # the browser already knows the session
+    assert events[-1]["session_id"] == OLD_SESSION
+
+
+@pytest.mark.parametrize(
+    "body, status, detail",
+    [
+        ({"text": "hi", "session_id": GONE_SESSION}, 404, "Conversation not found"),
+        ({"text": "CRASH"}, 502, "Claude failed: boom"),
+        ({"text": "ERROR"}, 502, "Claude failed: Not logged in · Please run /login"),
+        ({"text": "GARBAGE"}, 502, "Claude gave an answer that could not be read"),
+    ],
+)
+def test_stream_failures_are_error_events(body, status, detail):
+    res, events = stream(body)
+    assert res.status_code == 200
+    assert events[-1] == {"type": "error", "status": status, "detail": detail}
+
+
+def test_stream_timeout_is_an_error_event(monkeypatch):
+    monkeypatch.setattr(settings, "ask_timeout_seconds", 0.5)
+    _, events = stream({"text": "SLEEP"})
+    assert events[-1] == {"type": "error", "status": 504, "detail": "Claude took longer than 0.5 seconds"}
+
+
+def test_stream_empty_question_is_a_plain_422():
+    res, _ = stream({"text": "   "})
+    assert res.status_code == 422
+
+
+def test_stopping_the_stream_early_kills_claude():
+    async def run():
+        spawned = []
+        real_spawn = claude_cli._spawn
+
+        async def spy(session_id):
+            spawned.append(await real_spawn(session_id))
+            return spawned[-1]
+
+        claude_cli._spawn = spy
+        try:
+            gen = claude_cli.ask_stream("SLOW one two three four five six")
+            async for kind, _ in gen:
+                if kind == "delta":
+                    break
+            await gen.aclose()  # what the server does when the browser goes away
+            await asyncio.sleep(0.1)
+            return spawned[0].returncode
+        finally:
+            claude_cli._spawn = real_spawn
+
+    assert asyncio.run(run()) is not None
 
 
 # --- processes started ahead of time --------------------------------------------

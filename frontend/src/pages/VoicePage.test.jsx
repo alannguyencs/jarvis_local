@@ -5,12 +5,35 @@ vi.mock("../api/client", async (orig) => ({
   ...(await orig()),
   getHealth: vi.fn().mockResolvedValue({ status: "ok", stt_loaded: true }),
 }));
+// Claude's answer, streamed word by word. A test can change the text, or
+// hold the stream open after the first sentence with `fake.gate`.
+const fake = vi.hoisted(() => ({ answer: "", gate: null, signal: null }));
+const SESSION = "11111111-1111-1111-1111-111111111111";
 vi.mock("../api/voice", () => ({
   stt: vi.fn().mockResolvedValue({ text: "What is the capital of France?", duration_s: 1.6 }),
-  ask: vi.fn().mockResolvedValue({
-    answer: "The capital of France is Paris.",
-    session_id: "11111111-1111-1111-1111-111111111111",
-    duration_ms: 3000,
+  askStream: vi.fn(async (text, sessionId, { onSession, onDelta, signal } = {}) => {
+    fake.signal = signal;
+    if (!sessionId) onSession?.("11111111-1111-1111-1111-111111111111");
+    const words = fake.answer.split(/(?= )/);
+    for (const [i, word] of words.entries()) {
+      if (signal?.aborted) throw new DOMException("aborted", "AbortError");
+      onDelta?.(word);
+      await Promise.resolve();
+      // Hold after the word that follows the first sentence end: its leading
+      // space is what marks the sentence as finished.
+      if (fake.gate && i > 0 && /[.!?]$/.test(words[i - 1])) {
+        await fake.gate;
+        if (signal?.aborted) throw new DOMException("aborted", "AbortError");
+      }
+    }
+    return {
+      type: "done",
+      answer: fake.answer,
+      session_id: "11111111-1111-1111-1111-111111111111",
+      duration_ms: 1,
+      warm: true,
+      first_text_ms: 1,
+    };
   }),
   tts: vi.fn().mockResolvedValue(new Blob(["wav"], { type: "audio/wav" })),
 }));
@@ -57,6 +80,9 @@ class FakeAudio {
 }
 
 beforeEach(() => {
+  fake.answer = "The capital of France is Paris.";
+  fake.gate = null;
+  fake.signal = null;
   sessionStorage.clear();
   globalThis.MediaRecorder = FakeRecorder;
   globalThis.Audio = FakeAudio;
@@ -114,7 +140,9 @@ describe("VoicePage", () => {
     expect(status()).toMatch(/Speaking/);
     expect(FakeAudio.last.paused).toBe(false);
     // Each step's time, measured from releasing the mic.
-    expect(screen.getByText(/^heard \d+\.\d s · Claude \d+\.\d s · voice \d+\.\d s · first sound \d+\.\d s$/)).toBeTruthy();
+    expect(
+      screen.getByText(/^heard \d+\.\d s · Claude \d+\.\d s \(warm\) · sentence \d+\.\d s · voice \d+\.\d s · first sound \d+\.\d s$/),
+    ).toBeTruthy();
 
     await act(async () => FakeAudio.last.finish());
     await flush();
@@ -184,7 +212,7 @@ describe("VoicePage", () => {
   });
 
   it("keeps the chat and session across a reload; New conversation clears both", async () => {
-    const { ask } = await import("../api/voice");
+    const { askStream } = await import("../api/voice");
     await renderPage();
     await tap("Talk");
     await tap("Stop recording");
@@ -195,7 +223,7 @@ describe("VoicePage", () => {
     expect(screen.getByText("The capital of France is Paris.")).toBeTruthy();
     await tap("Talk");
     await tap("Stop recording");
-    expect(ask).toHaveBeenLastCalledWith("What is the capital of France?", "11111111-1111-1111-1111-111111111111");
+    expect(askStream).toHaveBeenLastCalledWith("What is the capital of France?", SESSION, expect.anything());
 
     fireEvent.click(screen.getByRole("button", { name: "New conversation" }));
     await flush();
@@ -234,14 +262,14 @@ describe("VoicePage", () => {
   });
 
   it("speaks a long answer piece by piece: the opening sentence first", async () => {
-    const { ask, tts } = await import("../api/voice");
+    const { tts } = await import("../api/voice");
     const long = [
       "The moon is about four and a half billion years old.",
       "It formed after a large body hit the early Earth, and the debris came together in orbit.",
       "It is slowly moving away from us, by about four centimetres every year.",
       "Its gravity causes most of the tides in our oceans.",
     ].join(" ");
-    ask.mockResolvedValueOnce({ answer: long, session_id: "11111111-1111-1111-1111-111111111111", duration_ms: 1, warm: true });
+    fake.answer = long;
     await renderPage();
     await tap("Talk");
     await tap("Stop recording");
@@ -258,5 +286,44 @@ describe("VoicePage", () => {
     await act(async () => FakeAudio.last.finish());
     await flush();
     expect(status()).toMatch(/Ready/);
+  });
+
+  it("starts speaking at the first sentence while Claude is still writing", async () => {
+    const { tts } = await import("../api/voice");
+    let release;
+    fake.gate = new Promise((r) => (release = r));
+    fake.answer = "The moon is about four and a half billion years old. It has no air, and no weather at all.";
+    await renderPage();
+    await tap("Talk");
+    await tap("Stop recording");
+
+    // Only the first sentence (and the next word) is written, and it is already playing.
+    expect(screen.getByText("The moon is about four and a half billion years old. It")).toBeTruthy();
+    expect(tts).toHaveBeenCalledWith("The moon is about four and a half billion years old.");
+    expect(status()).toMatch(/Speaking/);
+    expect(FakeAudio.last.paused).toBe(false);
+
+    await act(async () => release());
+    await flush();
+    expect(screen.getByText(fake.answer)).toBeTruthy(); // the rest arrived
+    await act(async () => FakeAudio.last.finish());
+    await flush();
+    expect(tts).toHaveBeenLastCalledWith("It has no air, and no weather at all.");
+  });
+
+  it("pressing the mic while Claude is still writing stops Claude", async () => {
+    fake.gate = new Promise(() => {}); // Claude never finishes on its own
+    fake.answer = "The moon is about four and a half billion years old. It has no air.";
+    await renderPage();
+    await tap("Talk");
+    await tap("Stop recording");
+    expect(status()).toMatch(/Speaking/);
+    expect(fake.signal.aborted).toBe(false);
+
+    await tap("Talk");
+    expect(fake.signal.aborted).toBe(true);
+    expect(status()).toMatch(/Listening/);
+    // What was written so far stays in the chat.
+    expect(screen.getByText("The moon is about four and a half billion years old. It")).toBeTruthy();
   });
 });

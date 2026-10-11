@@ -22,6 +22,7 @@ class AskOut(BaseModel):
     session_id: str
     duration_ms: int  # from sending the question to the answer
     warm: bool  # answered by a Claude process started ahead of time
+    first_text_ms: int | None = None  # from sending the question to the first words
 
 
 class TtsIn(BaseModel):

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Stands in for the `claude` CLI in tests, speaking its stream-json
 protocol: it starts, waits for one user message on stdin, then prints events
-ending in a `result`. What it does depends on the question:
+(with --include-partial-messages: a text delta per word) ending in a
+`result`. What it does depends on the question:
 
   SLEEP    hang (to test the timeout)
+  SLOW     write the answer slowly, one word every 0.2 s
   CRASH    exit 1 with a message on stderr
   ERROR    an is_error result
   GARBAGE  print something that is not JSON
@@ -45,11 +47,18 @@ if "GARBAGE" in question:
     sys.exit(0)
 
 error = "ERROR" in question
+answer = "Not logged in · Please run /login" if error else f"echo: {question}"
+if "--include-partial-messages" in argv and not error:
+    for i, word in enumerate(answer.split(" ")):
+        text = word if i == 0 else " " + word
+        emit({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": text}}})
+        if "SLOW" in question:
+            time.sleep(0.2)
 emit({
     "type": "result",
     "subtype": "success",
     "is_error": error,
-    "result": "Not logged in · Please run /login" if error else f"echo: {question}",
+    "result": answer,
     "session_id": session,
     "argv": argv,
 })
